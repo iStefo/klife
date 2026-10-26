@@ -31,6 +31,10 @@ defmodule Klife.Record do
     consumer callback (starts at `0`, incremented on each retry by the consumer group).
     This is a best-effort, in-memory counter. It may be reset to `0` after rebalances
     or unexpected crashes
+  - `:delivery_count`: share groups only (see `Klife.Consumer.ShareGroup`). The broker's
+    delivery count for this acquisition, starting at `1` and incremented every time
+    the record is redelivered. `nil` for records that do not come from a share group.
+    On share group records `:consumer_attempts` is set to `delivery_count - 1`.
   """
   defstruct [
     :key,
@@ -43,6 +47,7 @@ defmodule Klife.Record do
     :batch_attributes,
     :is_aborted,
     {:consumer_attempts, 0},
+    :delivery_count,
     {:headers, []},
     :__batch_index,
     :__estimated_size,
@@ -58,6 +63,7 @@ defmodule Klife.Record do
           offset: non_neg_integer(),
           timestamp: nil | integer(),
           consumer_attempts: nil | non_neg_integer(),
+          delivery_count: nil | pos_integer(),
           error_code: integer()
         }
 
