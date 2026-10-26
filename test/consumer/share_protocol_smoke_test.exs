@@ -40,7 +40,10 @@ defmodule Klife.Consumer.ShareProtocolSmokeTest do
     topic_id = MetadataCache.get_metadata_attribute(MyClient, @topic, 0, :topic_id)
 
     assignment = wait_assignment(coord, group, member_id, 0, 30)
-    assert %{topic_id: ^topic_id, partitions: parts} = Enum.find(assignment, &(&1.topic_id == topic_id))
+
+    assert %{topic_id: ^topic_id, partitions: parts} =
+             Enum.find(assignment, &(&1.topic_id == topic_id))
+
     assert 0 in parts
 
     leader = MetadataCache.get_metadata_attribute(MyClient, @topic, 0, :leader_id)
@@ -55,7 +58,9 @@ defmodule Klife.Consumer.ShareProtocolSmokeTest do
         max_bytes: 1_000_000,
         max_records: 500,
         batch_size: 500,
-        topics: [%{topic_id: topic_id, partitions: [%{partition_index: 0, acknowledgement_batches: []}]}],
+        topics: [
+          %{topic_id: topic_id, partitions: [%{partition_index: 0, acknowledgement_batches: []}]}
+        ],
         forgotten_topics_data: []
       })
 
@@ -81,7 +86,12 @@ defmodule Klife.Consumer.ShareProtocolSmokeTest do
         group_id: group,
         member_id: member_id,
         share_session_epoch: -1,
-        topics: [%{topic_id: topic_id, partitions: [%{partition_index: 0, acknowledgement_batches: acks}]}]
+        topics: [
+          %{
+            topic_id: topic_id,
+            partitions: [%{partition_index: 0, acknowledgement_batches: acks}]
+          }
+        ]
       })
 
     assert ack_resp.error_code == 0
