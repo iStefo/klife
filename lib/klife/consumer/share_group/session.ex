@@ -46,6 +46,9 @@ defmodule Klife.Consumer.ShareGroup.Session do
   @metadata_error_codes [3, 6, 100]
   @session_error_codes [122, 123]
 
+  # Used until the first ShareFetch response tells the real value.
+  @default_lock_timeout_ms 30_000
+
   @reset_backoff_ms 100
   @error_backoff_ms 1_000
 
@@ -62,10 +65,11 @@ defmodule Klife.Consumer.ShareGroup.Session do
     :max_records,
     :max_buffered_records,
     :request_timeout_ms,
-    :lock_timeout_ms,
     :in_flight,
+    :prune_ref,
     :backoff_ref,
     :close_from,
+    lock_timeout_ms: @default_lock_timeout_ms,
     epoch: 0,
     open?: false,
     closing?: false,
@@ -122,25 +126,33 @@ defmodule Klife.Consumer.ShareGroup.Session do
 
   @impl true
   def handle_call({:pull, max_records, owner}, _from, %__MODULE__{} = state) do
-    {taken, queue} = take_from_queue(state.buffer, max_records, [])
+    now = now_ms()
+
+    # Records that waited in the buffer for (almost) a whole acquisition lock
+    # were already released by the broker, they must not reach the user.
+    {taken, queue, outstanding, expired} =
+      take_valid(state, state.buffer, state.outstanding, max_records, now, [], 0)
+
     count = length(taken)
 
-    {outstanding, owners} =
-      Enum.reduce(taken, {state.outstanding, state.owners}, fn {key, rec}, {out, owners} ->
-        {tid, p} = key
-        {dc, _} = Map.fetch!(out, {tid, p, rec.offset})
-        {Map.put(out, {tid, p, rec.offset}, {dc, owner}), owners}
+    outstanding =
+      Enum.reduce(taken, outstanding, fn {{tid, p}, rec}, out ->
+        key = {tid, p, rec.offset}
+        {dc, _, acquired_at} = Map.fetch!(out, key)
+        Map.put(out, key, {dc, owner, acquired_at})
       end)
 
     owners =
-      if count > 0 and not Map.has_key?(owners, owner),
-        do: Map.put(owners, owner, Process.monitor(owner)),
-        else: owners
+      if count > 0 and not Map.has_key?(state.owners, owner),
+        do: Map.put(state.owners, owner, Process.monitor(owner)),
+        else: state.owners
+
+    log_expired(state, expired)
 
     state = %{
       state
       | buffer: queue,
-        buffered_count: state.buffered_count - count,
+        buffered_count: state.buffered_count - count - expired,
         outstanding: outstanding,
         owners: owners
     }
@@ -214,11 +226,16 @@ defmodule Klife.Consumer.ShareGroup.Session do
   def handle_info(:backoff_done, %__MODULE__{} = state),
     do: continue(%{state | backoff_ref: nil})
 
+  def handle_info(:prune, %__MODULE__{} = state) do
+    state = %{state | prune_ref: nil}
+    continue(state |> prune_expired() |> schedule_prune())
+  end
+
   def handle_info({:DOWN, ref, :process, pid, _reason}, %__MODULE__{} = state) do
     case Map.get(state.owners, pid) do
       ^ref ->
         {released, outstanding} =
-          Enum.split_with(state.outstanding, fn {_k, {_dc, owner}} -> owner == pid end)
+          Enum.split_with(state.outstanding, fn {_k, {_dc, owner, _at}} -> owner == pid end)
 
         pending =
           Enum.reduce(released, state.pending_acks, fn {{tid, p, offset}, _}, acc ->
@@ -491,8 +508,10 @@ defmodule Klife.Consumer.ShareGroup.Session do
       state
       | epoch: next_epoch(state.epoch),
         open?: true,
-        lock_timeout_ms: Map.get(content, :acquisition_lock_timeout_ms, state.lock_timeout_ms)
+        lock_timeout_ms: lock_timeout(content, state)
     }
+
+    state = schedule_prune(state)
 
     state =
       if in_flight.kind == :fetch do
@@ -621,6 +640,9 @@ defmodule Klife.Consumer.ShareGroup.Session do
       |> Enum.reject(fn rec -> rec.batch_attributes.is_control_batch end)
       |> Map.new(fn rec -> {rec.offset, rec} end)
 
+    acquired_at = now_ms()
+    state = supersede_buffered(state, tid, p, pdata.acquired_records)
+
     Enum.reduce(pdata.acquired_records, state, fn range, acc ->
       dc = range.delivery_count
 
@@ -633,7 +655,7 @@ defmodule Klife.Consumer.ShareGroup.Session do
               acc2
               | buffer: :queue.in({{tid, p}, rec}, acc2.buffer),
                 buffered_count: acc2.buffered_count + 1,
-                outstanding: Map.put(acc2.outstanding, {tid, p, offset}, {dc, nil})
+                outstanding: Map.put(acc2.outstanding, {tid, p, offset}, {dc, nil, acquired_at})
             }
 
           :error ->
@@ -648,7 +670,7 @@ defmodule Klife.Consumer.ShareGroup.Session do
 
   defp apply_ack({type, tid, p, offset, dc}, %__MODULE__{} = state) do
     case Map.get(state.outstanding, {tid, p, offset}) do
-      {^dc, _owner} ->
+      {^dc, _owner, _at} ->
         %{
           state
           | outstanding: Map.delete(state.outstanding, {tid, p, offset}),
@@ -668,6 +690,159 @@ defmodule Klife.Consumer.ShareGroup.Session do
 
   defp put_ack(pending, tid, p, offset, type),
     do: Map.update(pending, {tid, p}, %{offset => type}, &Map.put(&1, offset, type))
+
+  ## Lock expiry
+
+  # The broker releases an acquired record when its lock expires. A buffered
+  # (not yet pulled) record is dropped a safety margin earlier, so a user never
+  # receives a record whose acknowledgement is bound to fail.
+  defp buffered_expired?(%__MODULE__{lock_timeout_ms: lock}, acquired_at, now) do
+    margin = lock |> div(10) |> max(1_000) |> min(div(lock, 2))
+    now >= acquired_at + lock - margin
+  end
+
+  defp take_valid(_state, queue, outstanding, 0, _now, acc, expired),
+    do: {Enum.reverse(acc), queue, outstanding, expired}
+
+  defp take_valid(state, queue, outstanding, n, now, acc, expired) do
+    case :queue.out(queue) do
+      {{:value, {{tid, p}, rec} = item}, rest} ->
+        key = {tid, p, rec.offset}
+
+        case Map.get(outstanding, key) do
+          {_dc, nil, acquired_at} ->
+            if buffered_expired?(state, acquired_at, now) do
+              take_valid(state, rest, Map.delete(outstanding, key), n, now, acc, expired + 1)
+            else
+              take_valid(state, rest, outstanding, n - 1, now, [item | acc], expired)
+            end
+
+          _ ->
+            # No matching acquisition anymore, should not happen.
+            take_valid(state, rest, outstanding, n, now, acc, expired + 1)
+        end
+
+      {:empty, queue} ->
+        {Enum.reverse(acc), queue, outstanding, expired}
+    end
+  end
+
+  # Drops buffered records whose lock (almost) expired and forgets pulled but
+  # never acknowledged acquisitions whose lock expired: acks for them would fail
+  # with INVALID_RECORD_STATE anyway and the broker redelivers the records.
+  defp prune_expired(%__MODULE__{} = state) do
+    now = now_ms()
+
+    {buffer, outstanding, expired} =
+      state.buffer
+      |> :queue.to_list()
+      |> Enum.reduce({[], state.outstanding, 0}, fn {{tid, p}, rec} = item, {kept, out, exp} ->
+        key = {tid, p, rec.offset}
+
+        case Map.get(out, key) do
+          {_dc, nil, at} ->
+            if buffered_expired?(state, at, now),
+              do: {kept, Map.delete(out, key), exp + 1},
+              else: {[item | kept], out, exp}
+
+          _ ->
+            {kept, out, exp + 1}
+        end
+      end)
+
+    {outstanding, stale_pulled} =
+      outstanding
+      |> Enum.split_with(fn
+        {_key, {_dc, nil, _at}} -> true
+        {_key, {_dc, _owner, at}} -> now < at + state.lock_timeout_ms
+      end)
+
+    outstanding = Map.new(outstanding)
+
+    log_expired(state, expired)
+
+    if stale_pulled != [] do
+      Logger.debug(
+        "Forgetting #{length(stale_pulled)} unacknowledged records whose lock expired (client=#{inspect(state.client_name)}, group=#{state.group_name})",
+        client: state.client_name,
+        group: state.group_name
+      )
+    end
+
+    buffer = :queue.from_list(Enum.reverse(buffer))
+
+    %{
+      state
+      | buffer: buffer,
+        buffered_count: :queue.len(buffer),
+        outstanding: outstanding,
+        owners: demonitor_idle_owners(state.owners, outstanding)
+    }
+  end
+
+  defp demonitor_idle_owners(owners, outstanding) do
+    active = MapSet.new(outstanding, fn {_key, {_dc, owner, _at}} -> owner end)
+
+    Map.filter(owners, fn {pid, ref} ->
+      keep? = MapSet.member?(active, pid)
+      unless keep?, do: Process.demonitor(ref, [:flush])
+      keep?
+    end)
+  end
+
+  defp lock_timeout(content, state) do
+    case Map.get(content, :acquisition_lock_timeout_ms) do
+      ms when is_integer(ms) and ms > 0 -> ms
+      _ -> state.lock_timeout_ms
+    end
+  end
+
+  defp schedule_prune(%__MODULE__{prune_ref: nil} = state) do
+    interval = max(div(state.lock_timeout_ms, 2), 500)
+    %{state | prune_ref: Process.send_after(self(), :prune, interval)}
+  end
+
+  defp schedule_prune(%__MODULE__{} = state), do: state
+
+  # A fetch acquired offsets that are still buffered (unpulled) with a lower
+  # delivery count: the broker released the old acquisition, so the old buffered
+  # copy must go, otherwise the same offset would be buffered twice.
+  defp supersede_buffered(%__MODULE__{} = state, tid, p, ranges) do
+    superseded =
+      for range <- ranges,
+          offset <- range.first_offset..range.last_offset,
+          match?({_dc, nil, _at}, Map.get(state.outstanding, {tid, p, offset})),
+          into: MapSet.new(),
+          do: offset
+
+    if MapSet.size(superseded) == 0 do
+      state
+    else
+      kept =
+        state.buffer
+        |> :queue.to_list()
+        |> Enum.reject(fn {key, rec} -> key == {tid, p} and rec.offset in superseded end)
+
+      %{
+        state
+        | buffer: :queue.from_list(kept),
+          buffered_count: length(kept),
+          outstanding: Map.drop(state.outstanding, Enum.map(superseded, fn o -> {tid, p, o} end))
+      }
+    end
+  end
+
+  defp log_expired(_state, 0), do: :ok
+
+  defp log_expired(%__MODULE__{} = state, count) do
+    Logger.debug(
+      "Dropped #{count} buffered records whose acquisition lock expired before they were pulled (client=#{inspect(state.client_name)}, group=#{state.group_name})",
+      client: state.client_name,
+      group: state.group_name
+    )
+  end
+
+  defp now_ms(), do: System.monotonic_time(:millisecond)
 
   ## State helpers
 
@@ -736,15 +911,6 @@ defmodule Klife.Consumer.ShareGroup.Session do
         in_flight: nil,
         backoff_ref: ref
     }
-  end
-
-  defp take_from_queue(queue, 0, acc), do: {Enum.reverse(acc), queue}
-
-  defp take_from_queue(queue, n, acc) do
-    case :queue.out(queue) do
-      {{:value, item}, rest} -> take_from_queue(rest, n - 1, [item | acc])
-      {:empty, queue} -> {Enum.reverse(acc), queue}
-    end
   end
 
   defp next_epoch(@max_epoch), do: 1

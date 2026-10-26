@@ -389,6 +389,7 @@ defmodule Klife.Consumer.ShareGroup do
                 :table,
                 :recompute_ref,
                 :worker_supervisor,
+                fast_heartbeats: 0,
                 sessions: %{},
                 session_monitors: %{}
               ]
@@ -802,11 +803,33 @@ defmodule Klife.Consumer.ShareGroup do
     case do_heartbeat(state) do
       {:ok, new_state, next_ms} ->
         new_state = sync_sessions(new_state)
+        {new_state, next_ms} = fast_heartbeat(new_state, next_ms)
         Process.send_after(self(), :heartbeat, next_ms)
         {:noreply, new_state}
 
       {:error, reason} ->
         {:stop, reason, state}
+    end
+  end
+
+  # The first heartbeat response after a (re)join usually carries no assignment
+  # yet (it is computed asynchronously by the coordinator). While the assignment
+  # is empty, heartbeat sooner than `heartbeat_interval_ms` for a few tries so
+  # joining does not wait a full interval. Backs off and then falls back to the
+  # normal interval, e.g. for members that stay without partitions.
+  @fast_heartbeat_delays_ms [250, 250, 250, 500, 500, 500, 1_000, 1_000]
+
+  defp fast_heartbeat(%__MODULE__{assignment: assignment} = state, next_ms) do
+    cond do
+      MapSet.size(assignment) > 0 ->
+        {%{state | fast_heartbeats: 0}, next_ms}
+
+      state.fast_heartbeats < length(@fast_heartbeat_delays_ms) ->
+        delay = Enum.at(@fast_heartbeat_delays_ms, state.fast_heartbeats)
+        {%{state | fast_heartbeats: state.fast_heartbeats + 1}, min(delay, next_ms)}
+
+      true ->
+        {state, next_ms}
     end
   end
 
@@ -890,7 +913,7 @@ defmodule Klife.Consumer.ShareGroup do
           # Unknown member / fenced epoch: rejoin with the same member id, the
           # assignment is empty until the next one arrives.
           ec in [25, 110] ->
-            {:ok, %{state | epoch: 0, assignment: MapSet.new()}, 100}
+            {:ok, %{state | epoch: 0, assignment: MapSet.new(), fast_heartbeats: 0}, 100}
 
           true ->
             {:error, ec}
