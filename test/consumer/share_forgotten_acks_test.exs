@@ -24,7 +24,9 @@ defmodule Klife.Consumer.ShareForgottenAcksTest do
   @topic "test_share_topic_1"
 
   test "acks for forgotten partitions are accepted by ShareAcknowledge and do not re-add" do
-    group = "share_forgotten_#{System.unique_integer([:positive])}"
+    group =
+      "share_forgotten_#{System.unique_integer([:positive])}_#{System.os_time(:millisecond)}"
+
     set_earliest(group)
 
     tid = MetadataCache.get_metadata_attribute(MyClient, @topic, 0, :topic_id)
