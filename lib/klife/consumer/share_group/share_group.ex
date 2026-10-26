@@ -6,6 +6,7 @@ defmodule Klife.Consumer.ShareGroup do
   alias Klife.Connection.Broker
   alias Klife.Connection.Controller, as: ConnController
   alias Klife.Consumer.ShareGroup.Session
+  alias Klife.Consumer.ShareGroup.Worker
   alias Klife.Helpers
   alias Klife.MetadataCache
 
@@ -33,11 +34,32 @@ defmodule Klife.Consumer.ShareGroup do
           "per-topic options can be added in the future."
     ],
     mode: [
-      type: {:in, [:manual]},
-      default: :manual,
+      type: {:in, [nil, :auto, :manual]},
+      default: nil,
       doc:
-        "How records are consumed. Only `:manual` (records are fetched with `pull/2` and " <>
-          "acknowledged with `acknowledge/2`) is supported for now."
+        "How records are consumed. In `:auto` mode worker processes call the " <>
+          "`c:handle_record_batch/2` callback and acknowledge according to its return value. " <>
+          "In `:manual` mode records are fetched with `pull/2` and acknowledged with " <>
+          "`acknowledge/2`. When not set it defaults to `:auto` if the module implements " <>
+          "`c:handle_record_batch/2` and to `:manual` otherwise. Setting `:auto` explicitly on " <>
+          "a module without the callback raises."
+    ],
+    handler_concurrency: [
+      type: :pos_integer,
+      default: 1,
+      doc: "`:auto` mode only. Number of worker processes calling the callback concurrently."
+    ],
+    handler_max_batch_size: [
+      type: :pos_integer,
+      default: 100,
+      doc:
+        "`:auto` mode only. Maximum number of records handed to a single " <>
+          "`c:handle_record_batch/2` call."
+    ],
+    handler_idle_ms: [
+      type: :non_neg_integer,
+      default: 100,
+      doc: "`:auto` mode only. Time a worker waits after a pull that returned no records."
     ],
     share_auto_offset_reset: [
       type: {:in, [nil, :earliest, :latest]},
@@ -174,10 +196,33 @@ defmodule Klife.Consumer.ShareGroup do
 
   @type ack_type :: :accept | :release | :reject
 
+  @doc """
+  Handles a batch of records in `:auto` mode.
+
+  Called by the worker processes (see the `:handler_concurrency` option) with the
+  records they pulled, at most `:handler_max_batch_size` of them. A batch may mix
+  topics and partitions and carries no ordering guarantees.
+
+  Return either a single ack type, applied to the whole batch, or a list of
+  `{ack_type, record}` to acknowledge records individually. Records missing from the
+  list are released (a warning is logged once per batch). An invalid return value is
+  treated like a raising callback.
+
+  If the callback raises, throws or exits, the error is logged, the whole batch is
+  released and the worker keeps running. Released records are redelivered with a
+  higher `delivery_count`, and archived by the broker after
+  `share.delivery.count.limit` deliveries.
+  """
+  @callback handle_record_batch(group_name :: String.t(), list(Klife.Record.t())) ::
+              ack_type | list({ack_type, Klife.Record.t()})
+
+  @optional_callbacks handle_record_batch: 2
+
   defmacro __using__(opts) do
     quote bind_quoted: [opts: opts] do
       # Gives the group time to close its sessions before the supervisor kills it.
       use GenServer, shutdown: 10_000
+      Klife.Consumer.ShareGroup
 
       if opts[:client] do
         def klife_client(), do: unquote(opts[:client])
@@ -271,6 +316,7 @@ defmodule Klife.Consumer.ShareGroup do
                 :session_supervisor,
                 :table,
                 :recompute_ref,
+                :worker_supervisor,
                 sessions: %{},
                 session_monitors: %{}
               ]
@@ -280,7 +326,7 @@ defmodule Klife.Consumer.ShareGroup do
 
   @doc false
   def start_link(sg_mod, args) do
-    validated = NimbleOptions.validate!(args, @share_group_opts)
+    validated = args |> NimbleOptions.validate!(@share_group_opts) |> resolve_mode!(sg_mod)
     client = Keyword.fetch!(validated, :client)
 
     :ok = bind_client!(sg_mod, client)
@@ -299,6 +345,27 @@ defmodule Klife.Consumer.ShareGroup do
     GenServer.start_link(sg_mod, state_map,
       name: get_process_name(client, sg_mod, state_map.group_name)
     )
+  end
+
+  defp resolve_mode!(validated, sg_mod) do
+    exported? =
+      Code.ensure_loaded?(sg_mod) and function_exported?(sg_mod, :handle_record_batch, 2)
+
+    case {Keyword.fetch!(validated, :mode), exported?} do
+      {nil, true} ->
+        Keyword.put(validated, :mode, :auto)
+
+      {nil, false} ->
+        Keyword.put(validated, :mode, :manual)
+
+      {:auto, false} ->
+        raise ArgumentError,
+              "#{inspect(sg_mod)} does not implement handle_record_batch/2, which is " <>
+                "required for mode: :auto. Implement the callback or set mode: :manual."
+
+      {mode, _} ->
+        Keyword.put(validated, :mode, mode)
+    end
   end
 
   # Same permanent client binding semantics as Klife.Consumer.ConsumerGroup.
@@ -506,6 +573,9 @@ defmodule Klife.Consumer.ShareGroup do
         group_name: args_map.group_name,
         topics: args_map.topics,
         mode: args_map.mode,
+        handler_concurrency: args_map.handler_concurrency,
+        handler_max_batch_size: args_map.handler_max_batch_size,
+        handler_idle_ms: args_map.handler_idle_ms,
         share_auto_offset_reset: args_map.share_auto_offset_reset,
         max_wait_ms: args_map.max_wait_ms,
         min_bytes: args_map.min_bytes,
@@ -527,6 +597,8 @@ defmodule Klife.Consumer.ShareGroup do
 
     state = get_coordinator!(state)
 
+    state = maybe_start_workers(state)
+
     send(self(), :heartbeat)
 
     Logger.info(
@@ -536,6 +608,39 @@ defmodule Klife.Consumer.ShareGroup do
     )
 
     {:ok, state}
+  end
+
+  defp maybe_start_workers(%__MODULE__{mode: :manual} = state), do: state
+
+  defp maybe_start_workers(%__MODULE__{mode: :auto} = state) do
+    {:ok, sup} = DynamicSupervisor.start_link(strategy: :one_for_one)
+
+    for _ <- 1..state.handler_concurrency do
+      {:ok, _pid} =
+        DynamicSupervisor.start_child(
+          sup,
+          {Worker,
+           client: state.client_name,
+           mod: state.mod,
+           group_name: state.group_name,
+           max_batch_size: state.handler_max_batch_size,
+           idle_ms: state.handler_idle_ms}
+        )
+    end
+
+    %{state | worker_supervisor: sup}
+  end
+
+  defp stop_workers(%__MODULE__{worker_supervisor: nil}), do: :ok
+
+  defp stop_workers(%__MODULE__{worker_supervisor: sup}) do
+    # Each worker finishes (and acknowledges) its current batch, bounded by the
+    # worker shutdown timeout of 4s. Children are terminated in parallel.
+    try do
+      DynamicSupervisor.stop(sup, :shutdown, 5_000)
+    catch
+      :exit, _ -> :ok
+    end
   end
 
   defp maybe_set_offset_reset(%__MODULE__{share_auto_offset_reset: nil}), do: :ok
@@ -909,6 +1014,9 @@ defmodule Klife.Consumer.ShareGroup do
       group: state.group_name
     )
 
+    # Workers go first so their last batch is acknowledged before the sessions close.
+    stop_workers(state)
+
     # Stop serving pulls and acks, then close every session so unacknowledged
     # records are released right away.
     :ets.delete_all_objects(state.table)
@@ -918,12 +1026,12 @@ defmodule Klife.Consumer.ShareGroup do
     |> Task.async_stream(
       fn pid ->
         try do
-          Session.close(pid, 5_000)
+          Session.close(pid, 3_000)
         catch
           :exit, _reason -> :ok
         end
       end,
-      timeout: 6_000,
+      timeout: 3_500,
       on_timeout: :kill_task
     )
     |> Enum.to_list()
