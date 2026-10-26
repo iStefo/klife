@@ -116,10 +116,82 @@ defmodule Klife.Consumer.ShareGroup do
   Share groups require Kafka 4.1 or newer (and the `share.version` feature
   enabled on the cluster).
 
-  This first version only supports the `:manual` mode: your code pulls records
-  with `pull/2` and acknowledges them with `acknowledge/2` or `acknowledge/3`.
+  Records can be consumed in two modes: `:auto`, where worker processes call your
+  `c:handle_record_batch/2` callback (see "Auto mode"), and `:manual`, where your
+  code pulls records with `pull/2` and acknowledges them with `acknowledge/2` or
+  `acknowledge/3`.
 
-  ## Defining a share group
+  ## Share groups vs consumer groups
+
+  Use a `Klife.Consumer.ConsumerGroup` when ordering matters: each partition is
+  consumed by a single member at a time, in offset order, and progress is a
+  committed offset. Use a share group when you want a work queue:
+
+  - **No ordering**: records of a partition are spread over the members and may be
+    processed (and retried) in any order.
+  - **Per-record acknowledgements**: each record is accepted, released (retried) or
+    rejected on its own. One slow or failing record does not block the others.
+  - **Scaling beyond the partition count**: members are not limited by the number of
+    partitions, any member may receive records of any partition.
+  - **Delivery count and poison messages**: every record carries a `delivery_count`
+    and the broker archives it after `share.delivery.count.limit` deliveries (5 by
+    default), so a poison message cannot block the group forever.
+  - **Kafka >= 4.1 required**, with the `share.version` feature enabled.
+
+  ## Auto mode
+
+  In `:auto` mode (the default for modules implementing `c:handle_record_batch/2`)
+  the group runs `:handler_concurrency` worker processes. Each worker pulls a batch
+  of up to `:handler_max_batch_size` records, calls the callback and acknowledges
+  the result:
+
+  ```elixir
+  defmodule MyApp.MyShareGroup do
+    use Klife.Consumer.ShareGroup,
+      client: MyApp.MyClient,
+      group_name: "my_share_group",
+      topics: [[name: "my_topic"]],
+      share_auto_offset_reset: :earliest,
+      handler_concurrency: 4,
+      handler_max_batch_size: 50
+
+    @impl true
+    def handle_record_batch(_group_name, records) do
+      Enum.map(records, fn rec ->
+        case MyApp.process(rec) do
+          :ok -> {:accept, rec}
+          {:error, :temporary} -> {:release, rec}
+          {:error, :invalid} -> {:reject, rec}
+        end
+      end)
+    end
+  end
+  ```
+
+  Returning a single ack type (e.g. `:accept`) applies it to the whole batch. If the
+  callback raises, throws or exits the error is logged, the whole batch is released
+  (and so redelivered with a higher `delivery_count`) and the worker keeps running.
+  Workers are the owners of the records they pull, see "Ownership".
+
+  When the group is stopped the workers finish and acknowledge the batch they are
+  processing (for up to 4 seconds) before the sessions are closed.
+
+  ## Manual mode
+
+  In `:manual` mode no workers are started and you consume with `pull/2` and
+  `acknowledge/3` yourself.
+
+  ## Using with Broadway
+
+  A Broadway producer can use a manual mode share group: in `handle_demand/2` it
+  calls `pull/2` with `max_records` set to the demand (the producer process is the
+  owner, so its unacknowledged records are released if it crashes), emits the records
+  as messages, and in the Broadway `ack/3` callback calls `acknowledge/3` with
+  `:accept` for successful messages and `:release` or `:reject` for failed ones. Since
+  `pull/2` never blocks, the producer should poll it periodically while there is
+  demand. No code dependency between Klife and Broadway is needed.
+
+  ## Defining a share group (manual mode)
 
   ```elixir
   defmodule MyApp.MyShareGroup do
@@ -187,7 +259,7 @@ defmodule Klife.Consumer.ShareGroup do
   ## Architecture
 
   The share group process takes care of membership (`ShareGroupHeartbeat`) and
-  starts one `Klife.Consumer.ShareGroup.Session` process for each broker leading
+  starts one session process for each broker leading
   at least one assigned partition. Sessions own the share session with their broker,
   buffer the acquired records and send the acknowledgements. `pull/2` and
   `acknowledge/3` talk directly to the sessions and do not go through the group

@@ -15,6 +15,7 @@ Klife is a modern, ergonomic and high-performance Kafka client built from the gr
 ## Key Features
 
 - **Consumer Group**: The new [KIP-848 rebalance protocol](https://cwiki.apache.org/confluence/display/KAFKA/KIP-848%3A+The+Next+Generation+of+the+Consumer+Rebalance+Protocol) introduced in Kafka 4.0.
+- **Share Group (KIP-932)**: Queue-like consumption with per-record acknowledgements, no partition ownership and no ordering, so you can scale consumers beyond the partition count. Requires Kafka 4.1+.
 - **Custom Consumer Configuration**: Per-topic consumer settings within the same group.
 - **Static Membership**: Stable consumer identity via `instance_id`.
 - **Backpressure**: Fetch rate naturally regulated by processing speed, with multiple configurable controls.
@@ -121,6 +122,33 @@ Supervisor.start_link(children, opts)
 
 Check out the `Klife.Consumer.ConsumerGroup` [docs](https://hexdocs.pm/klife/Klife.Consumer.ConsumerGroup.html) for more details regarding the consumer group behaviour and configuration options!
 
+## Share Group (KIP-932)
+
+Share groups are an alternative to consumer groups for queue-like workloads: records are acknowledged one by one (accept, release or reject) and any member may receive records of any partition, so there is no ordering guarantee and no limit on the number of consumers. Define a Share Group module:
+
+```elixir
+defmodule MyApp.MyShareGroup do
+  use Klife.Consumer.ShareGroup,
+    client: MyApp.Client,
+    group_name: "my_share_group",
+    topics: [[name: "my_topic"]],
+    share_auto_offset_reset: :earliest,
+    handler_concurrency: 4
+
+  @impl true
+  def handle_record_batch(_group_name, record_list) do
+    Enum.map(record_list, fn %Klife.Record{} = rec ->
+      IO.inspect("Consuming record with offset #{rec.offset} and value #{rec.value}!")
+      {:accept, rec}
+    end)
+  end
+end
+```
+
+and then start it under your supervision tree like the consumer group above. Records that are released or whose callback raises are redelivered with a higher `delivery_count`. Modules without the callback run in `:manual` mode, where you fetch records with `pull/2` and acknowledge them with `acknowledge/2`.
+
+Share groups require Kafka 4.1 or newer. Check out the `Klife.Consumer.ShareGroup` [docs](https://hexdocs.pm/klife/Klife.Consumer.ShareGroup.html) for more details regarding delivery semantics and configuration options!
+
 ## Reliability
 
 Klife has been validated through thousands of randomized simulation runs using a dedicated chaos testing framework. Each simulation generates a unique scenario from a vast configuration space randomizing all possible configurations.
@@ -150,7 +178,7 @@ The full simulator source code is available in the `simulator` directory.
 
 The focus of Klife is to support the most recent versions of Kafka (i.e. >= 4.0); all development and testing was performed almost exclusively on these versions.
 
-That said, it is possible to use some features of Klife on older versions. The consumer group feature will not work on older brokers, but for produce-only workflows Klife may still work fine (Kafka versions >= 2.4).
+That said, it is possible to use some features of Klife on older versions. The consumer group feature (and share groups, which need Kafka >= 4.1) will not work on older brokers, but for produce-only workflows Klife may still work fine (Kafka versions >= 2.4).
 
 During startup, Klife will emit warning logs for any features that were disabled due to lack of compatibility with the broker. The logs follow the format: `[Name of the feature] feature disabled due...`.
 
