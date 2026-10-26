@@ -179,10 +179,20 @@ defmodule Klife.Consumer.ShareGroupRobustnessTest do
 
     Process.sleep(4_500)
 
-    # The group starts at the earliest offset, so every session holds a full
-    # buffer of (mostly foreign) records acquired >4s ago. The broker released
-    # them after 2s, a pull must not hand out any of them.
-    assert {:ok, [_ | _] = first} = mod.pull(group, max_records: 100)
+    # The group starts at the earliest offset, so every session filled its
+    # buffer (with mostly foreign records) at the start and stopped fetching.
+    # The broker released those records after 2s: they were dropped (by the
+    # prune timer or at pull time) and replaced by fresh acquisitions, a pull
+    # must never hand out an acquisition older than the lock. The buffers may be
+    # momentarily empty right after a prune, so retry until a refetch arrived.
+    first =
+      Enum.find_value(1..100, fn _ ->
+        case mod.pull(group, max_records: 100) do
+          {:ok, [_ | _] = recs} -> recs
+          {:ok, :empty} -> Process.sleep(50) && nil
+        end
+      end) || flunk("nothing could be pulled")
+
     pulled_at = now()
 
     states = session_states(mod, group)
