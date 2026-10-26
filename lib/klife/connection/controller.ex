@@ -417,6 +417,16 @@ defmodule Klife.Connection.Controller do
     :persistent_term.put({__MODULE__, client_name, feature, :disabled?}, true)
   end
 
+  def disable_feature(:share_group = feature, client_name) do
+    Logger.warning(
+      "Share Group feature disabled due to API version negotiation failure (client=#{inspect(client_name)})",
+      client: client_name,
+      feature: feature
+    )
+
+    :persistent_term.put({__MODULE__, client_name, feature, :disabled?}, true)
+  end
+
   def disabled_feature?(client_name, feature),
     do: :persistent_term.get({__MODULE__, client_name, feature, :disabled?}, false)
 

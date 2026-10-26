@@ -58,7 +58,11 @@ defmodule Klife.Connection.MessageVersions do
       {M.ConsumerGroupHeartbeat, %{min: 1, max: 1, required_for: [:consumer_group]}},
       {M.OffsetFetch, %{min: 9, max: 9, required_for: [:consumer_group]}},
       {M.OffsetCommit, %{min: 9, max: 9, required_for: [:consumer_group]}},
-      {M.CreatePartitions, %{min: 3, max: 3, required_for: [:simulator]}}
+      {M.CreatePartitions, %{min: 3, max: 3, required_for: [:simulator]}},
+      {M.IncrementalAlterConfigs, %{min: 0, max: 1, required_for: []}},
+      {M.ShareGroupHeartbeat, %{min: 1, max: 1, required_for: [:share_group]}},
+      {M.ShareFetch, %{min: 1, max: 1, required_for: [:share_group]}},
+      {M.ShareAcknowledge, %{min: 1, max: 1, required_for: [:share_group]}}
     ]
   end
 

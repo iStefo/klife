@@ -77,7 +77,7 @@ defmodule Klife.MixProject do
   # Run "mix help deps" to learn about dependencies.
   defp deps do
     [
-      {:klife_protocol, "~> 1.0"},
+      {:klife_protocol, github: "iStefo/klife_protocol", branch: "kafka-4.2-messages"},
       {:nimble_options, "~> 1.0"},
       {:nimble_pool, "~> 1.1"},
       {:uuid, "~> 1.1"},
