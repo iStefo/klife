@@ -48,6 +48,7 @@ defmodule Klife.MixProject do
             Klife.Consumer.ConsumerGroup,
             Klife.Consumer.ConsumerGroup.TopicConfig
           ],
+          "Share Group": [Klife.Consumer.ShareGroup],
           Producer: [
             Klife.Producer,
             Klife.Producer.DefaultPartitioner,

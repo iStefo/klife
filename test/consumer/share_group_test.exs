@@ -344,6 +344,40 @@ defmodule Klife.Consumer.ShareGroupTest do
     end
   end
 
+  test "acks for partitions that were reassigned to another member are still applied" do
+    mod1 = new_mod()
+    mod2 = new_mod()
+    define_share_group(mod1)
+    define_share_group(mod2)
+    {group, prefix} = new_ids()
+
+    # Long enough to survive the heartbeat interval needed to observe the rebalance.
+    :ok = set_group_config(group, "share.record.lock.duration.ms", "15000")
+
+    produce(prefix, 20)
+    start_group(mod1, group)
+
+    first = pull_until(mod1, group, prefix, 20, ack: nil)
+    assert length(wait_for_assignment(mod1, group, 4)) == 4
+
+    start_group(mod2, group)
+    deadline = System.monotonic_time(:millisecond) + 30_000
+    {a1, _a2} = wait_for_split(mod1, mod2, group, deadline)
+    assert length(a1) < 4
+
+    # Member 1 lost some partitions but still holds records of them.
+    :ok = mod1.acknowledge(group, first, :accept)
+
+    # If the acks of the forgotten partitions were lost the locks would expire
+    # (15s) and the records would be delivered again.
+    tasks =
+      for m <- [mod1, mod2] do
+        Task.async(fn -> pull_for(m, group, prefix, 17_000) end)
+      end
+
+    assert [] = tasks |> Task.await_many(30_000) |> List.flatten()
+  end
+
   test "stopping a member releases its unacknowledged records to other members" do
     mod1 = new_mod()
     mod2 = new_mod()
